@@ -93,10 +93,37 @@ level3_collectibles:
     db 3,20,COLLECTIBLE_TYPE_COIN
     db 15,20,COLLECTIBLE_TYPE_GEM
 
+;----------------------------------------------------------
+; Level 4 collectibles -- deliberately split two ways:
+;
+;   - 2 "legit" items sit ON the true solution path (roughly
+;     a third and two-thirds of the way along it), same as
+;     every other level -- a normal progress reward.
+;   - 2 "bait" items sit deep inside two of the level's
+;     decoy loops (see the comment above level4_data in
+;     maze.asm), 22-23 tiles down a dead end. Finding a coin
+;     or gem down a side corridor is meant to read as "you're
+;     on the right track," which is exactly the wrong
+;     conclusion in a maze whose whole point is that some
+;     inviting-looking branches don't lead anywhere.
+;
+; All 4 positions were checked against the same rule used for
+; every other level: each sits on a tile reachable from P AND
+; has at least two open neighboring tiles, so nothing renders
+; visually embedded in a wall.
+;----------------------------------------------------------
+
+level4_collectibles:
+    db 4,17,COLLECTIBLE_TYPE_COIN    ; legit -- on true path
+    db 11,33,COLLECTIBLE_TYPE_GEM    ; legit -- on true path
+    db 1,16,COLLECTIBLE_TYPE_COIN    ; bait  -- dead-end loop, depth 22
+    db 3,30,COLLECTIBLE_TYPE_GEM     ; bait  -- dead-end loop, depth 23
+
 collectible_table:
     dq level1_collectibles
     dq level2_collectibles
     dq level3_collectibles
+    dq level4_collectibles
 
 
 section .bss
@@ -274,27 +301,39 @@ current_level_index:
 ;   AL = 1 if a next level exists and was loaded,
 ;        0 if that was the last level (game_state -> 2)
 ;
+; IMPORTANT: level_index is deliberately NOT incremented
+; past NUM_LEVELS-1. reset_game_state() uses level_index to
+; index directly into collectible_table with no bounds check
+; of its own -- if level_index were allowed to sit at
+; NUM_LEVELS (one past the last valid entry) and
+; reset_game_state() were ever called again afterward (e.g.
+; a future "play again" path), it would read one descriptor
+; past the end of collectible_table. Today nothing calls
+; reset_game_state() after the last level, so this couldn't
+; yet happen -- clamping here means it never can, regardless
+; of what main.asm does with game_state later.
+;
 ;=========================================================
 
 
 advance_level:
 
-    inc byte [rel level_index]
-
     call get_num_levels        ; AL = NUM_LEVELS
+    dec al                     ; AL = highest valid index
 
     cmp [rel level_index],al
-    jl .more_levels
+    jge .no_more_levels
 
-    ; no more levels -- whole game complete
+    inc byte [rel level_index]
+    mov al,1
+    ret
+
+.no_more_levels:
+
+    ; stay on the last valid index -- do not increment past it
 
     mov byte [rel game_state],2
     mov al,0
-    ret
-
-.more_levels:
-
-    mov al,1
     ret
 
 
