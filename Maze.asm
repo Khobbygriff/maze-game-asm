@@ -120,6 +120,69 @@ level3_height equ 17
 
 
 ;----------------------------------------------------------
+; Level 4 -- final level, largest and hardest (218-move
+; shortest path). Unlike levels 1-3, this maze is not a pure
+; "perfect maze" (single unique route between any two
+; points) -- it was generated the same way (randomized DFS
+; carve, then BFS-verified), and THEN deliberately "braided"
+; by reopening a small number of interior walls to create
+; loops branching directly off the true solution path.
+;
+; Each opened wall was re-verified with BFS after opening it
+; to guarantee two things:
+;   1. The shortest path from P to E is IDENTICAL in length
+;      to the un-braided maze (opening a wall never creates
+;      a shortcut -- it only ever adds a longer detour).
+;   2. The branch point sits ON the true path, so a player
+;      following the correct route will actually encounter
+;      and be tempted by it, rather than the decoy sitting
+;      somewhere they'd never walk past.
+;
+; What this means concretely: there is exactly one 'E' tile
+; (get_tile/check_win in game.asm treat any 'E' as an
+; instant win, so a maze can only have one real exit without
+; changing that logic -- there is no "fake E" here, and this
+; file doesn't pretend otherwise). The "multiple paths, only
+; one correct" challenge instead comes from three long dead-
+; end loops (traced and measured during generation at 22,
+; 23, and 24 tiles deep) that peel off the real route and
+; double back on themselves. A player has to actually commit
+; real distance down a loop before discovering it doesn't
+; lead anywhere new -- that's the trap, not a disguised exit.
+;
+; Two of the four collectibles on this level sit deep inside
+; those decoy loops (see level4_collectibles in game.asm) as
+; deliberate bait: a coin or gem glimpsed down a side corridor
+; reads as "you're on the right track," which is exactly the
+; false signal a real maze trap should give.
+;----------------------------------------------------------
+
+level4_data:
+    db "#########################################"
+    db "#P  #         #     #             #     #"
+    db "### ##### ### # # # ##### # ##### ### # #"
+    db "# # #   #   #   # #     #   #   #     # #"
+    db "# # # # ### ##### ##### ### # ######### #"
+    db "# #   #   # # #   #   #   # #         # #"
+    db "# ####### # #   ### # ### # ####### ### #"
+    db "#       # #   #   # # #     #     #   # #"
+    db "### ### # ####### # # ####### # # ### # #"
+    db "#   #   #       #   #     # #   #     # #"
+    db "# ############# # ####### # # # ##### # #"
+    db "#             # # #   #   # # #     # # #"
+    db "# ####### ## ## # ### # ### # ##### ### #"
+    db "# #     #     # #     # #   # #     #   #"
+    db "# ##### ##### # ####### # ### # ##### ###"
+    db "# #     #E  # #         #     #       # #"
+    db "# # ### ### # ########### ############# #"
+    db "#   #       #                           #"
+    db "#########################################"
+
+level4_width  equ 41
+level4_height equ 19
+
+
+;----------------------------------------------------------
 ; Level table
 ;
 ; Each entry: dq maze_ptr, dq width, dq height
@@ -129,14 +192,15 @@ level_table:
     dq level1_data, level1_width, level1_height
     dq level2_data, level2_width, level2_height
     dq level3_data, level3_width, level3_height
+    dq level4_data, level4_width, level4_height
 
 LEVEL_DESCRIPTOR_SIZE equ 24
-NUM_LEVELS             equ 3
+NUM_LEVELS             equ 4
 
 
 ;----------------------------------------------------------
 ; Player start position per level (row, col), matching the
-; 'P' marker placed in each maze above. All three generated
+; 'P' marker placed in each maze above. All four generated
 ; mazes place P at (1,1) since the carve algorithm always
 ; begins there, but this table exists so that isn't a
 ; hardcoded assumption elsewhere in the code -- a future
@@ -144,8 +208,8 @@ NUM_LEVELS             equ 3
 ; anywhere without touching player.asm or main.asm.
 ;----------------------------------------------------------
 
-start_rows: db 1, 1, 1
-start_cols: db 1, 1, 1
+start_rows: db 1, 1, 1, 1
+start_cols: db 1, 1, 1, 1
 
 
 ;----------------------------------------------------------
