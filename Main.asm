@@ -26,7 +26,7 @@ moves_label_len   equ $ - moves_label
 score_label       db "  SCORE: "
 score_label_len   equ $ - score_label
 
-quit_hint         db "  (WASD to move, ESC to quit)"
+quit_hint         db "  (WASD to move, R to restart, ESC to quit, H for help)"
 quit_hint_len     equ $ - quit_hint
 
 final_score_label db "FINAL SCORE: "
@@ -37,6 +37,12 @@ name_prompt_len  equ $ - name_prompt
 
 name_greeting_prefix     db "  Player: "
 name_greeting_prefix_len equ $ - name_greeting_prefix
+
+highscore_header    db "HIGH SCORES:"
+highscore_header_len equ $ - highscore_header
+
+score_separator     db " - "
+score_separator_len equ $ - score_separator
 
 ; --- Splash screen ---
 ; Cleared and redrawn as a set of print_string calls at
@@ -49,6 +55,9 @@ splash_title_len  equ $ - splash_title
 
 splash_hint       db "Press any key to start  --  press H for help"
 splash_hint_len   equ $ - splash_hint
+
+level_select_prompt db "Select starting level: [1] [2] [3]   (press H for help)"
+level_select_prompt_len equ $ - level_select_prompt
 
 ; --- Help screen ---
 
@@ -69,6 +78,9 @@ help_line4_len    equ $ - help_line4
 
 help_line5        db "Green  E ... exit  (finishes the level)"
 help_line5_len    equ $ - help_line5
+
+help_line6        db "Red    X ... hazard (-50 points, resets position)"
+help_line6_len    equ $ - help_line6
 
 help_back_hint    db "Press any key to return"
 help_back_hint_len equ $ - help_back_hint
@@ -125,6 +137,17 @@ extern current_height
 extern read_line
 extern set_color
 extern reset_color
+extern load_highscores
+extern save_highscores
+extern insert_highscore
+extern highscore_table
+extern restart_level
+extern mark_visited
+extern player_row
+extern player_col
+extern check_hazard
+extern set_level_index
+extern reset_score
 
 ; Mirror of terminal.asm's color constants -- must stay in
 ; sync (NASM equ constants don't cross files).
@@ -149,6 +172,8 @@ _start:
     lea rdi,[rel player_name]
     mov rsi,PLAYER_NAME_MAX_LEN
     call read_line
+
+    call load_highscores
 
     call enable_raw_mode
 
@@ -180,21 +205,62 @@ splash_screen:
 
     call print_player_name
 
+    ; Display high scores
+
+    call display_highscores
+
     mov rdi,13
     mov rsi,5
     call move_cursor
 
-    mov rsi,splash_hint
-    mov rdx,splash_hint_len
+    mov rsi,level_select_prompt
+    mov rdx,level_select_prompt_len
     call print_string
 
+.level_select_loop:
+
     call read_key
+
+    cmp al,27                  ; ESC to quit
+    je quit
 
     cmp al,'h'
     je help_screen
     cmp al,'H'
     je help_screen
 
+    cmp al,'1'
+    je .level_1
+    cmp al,'2'
+    je .level_2
+    cmp al,'3'
+    je .level_3
+
+    ; Any other key - ignore and keep waiting
+    jmp .level_select_loop
+
+.level_1:
+
+    xor dil,dil                ; level index 0
+    call set_level_index
+    jmp start_level
+
+.level_2:
+
+    mov dil,1                  ; level index 1
+    call set_level_index
+    jmp start_level_with_reset
+
+.level_3:
+
+    mov dil,2                  ; level index 2
+    call set_level_index
+    jmp start_level_with_reset
+
+start_level_with_reset:
+
+    ; Reset score to 0 for non-level-1 starts
+    call reset_score
     jmp start_level
 
 
@@ -250,7 +316,14 @@ help_screen:
     mov rdx,help_line5_len
     call print_string
 
-    mov rdi,11
+    mov rdi,10
+    mov rsi,5
+    call move_cursor
+    mov rsi,help_line6
+    mov rdx,help_line6_len
+    call print_string
+
+    mov rdi,12
     mov rsi,5
     call move_cursor
     mov rsi,help_back_hint
@@ -278,6 +351,120 @@ print_player_name:
     lea rsi,[rel player_name]
     call print_len_string
 
+    ret
+
+
+;=========================================================
+;
+; display_highscores()
+;
+; Displays the top 3 high scores on the splash screen.
+;
+;=========================================================
+
+display_highscores:
+
+    push rbx
+    push r12
+    push r13
+
+    mov rdi,14
+    mov rsi,5
+    call move_cursor
+
+    mov al,COLOR_HUD
+    call set_color
+
+    mov rsi,highscore_header
+    mov rdx,highscore_header_len
+    call print_string
+
+    call reset_color
+
+    ; Loop through 3 records
+
+    xor rbx,rbx                ; rbx = record index
+
+.hs_loop:
+
+    cmp rbx,3
+    jge .hs_done
+
+    ; Calculate record address
+
+    lea r12,[rel highscore_table]
+    mov rax,rbx
+    imul rax,28                ; HIGHSCORE_RECORD_SIZE
+    add r12,rax
+
+    ; Check if score is non-zero
+
+    mov r13,[r12+20]           ; score field (offset 20)
+    cmp r13,0
+    je .hs_next                ; skip empty records
+
+    ; Position cursor for this entry
+
+    mov rdi,15
+    mov rsi,5
+    add rdi,rbx
+    call move_cursor
+
+    ; Print rank
+
+    mov al,'1'
+    add al,bl
+    call print_char
+
+    mov al,'.'
+    call print_char
+
+    mov al,' '
+    call print_char
+
+    ; Print name (up to 20 chars, stop at null)
+
+    mov rdi,r12
+    mov rcx,20
+
+.name_loop:
+    cmp rcx,0
+    je .name_done
+    mov al,[rdi]
+    cmp al,0
+    je .name_done
+    call print_char
+    inc rdi
+    dec rcx
+    jmp .name_loop
+
+.name_done:
+
+    ; Print separator
+
+    mov rsi,score_separator
+    mov rdx,score_separator_len
+    call print_string
+
+    ; Print score
+
+    mov rax,r13
+    lea rdi,[rel hud_number_buffer]
+    call int_to_string
+
+    lea rsi,[rel hud_number_buffer]
+    call print_len_string
+
+.hs_next:
+
+    inc rbx
+    jmp .hs_loop
+
+.hs_done:
+
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 
@@ -330,6 +517,13 @@ game_loop:
     cmp al,27
     je quit
 
+    ; R key restarts the current level
+
+    cmp al,'r'
+    je .restart_key
+    cmp al,'R'
+    je .restart_key
+
     ; Ignore keys that aren't movement keys so the move
     ; counter and redraw only fire on real attempts
 
@@ -344,6 +538,11 @@ game_loop:
 
     jmp game_loop
 
+.restart_key:
+
+    call restart_level
+    jmp redraw_level
+
 .valid_key:
 
     ; AL holds the pressed key here, but erase_player() will
@@ -353,6 +552,11 @@ game_loop:
 
     mov bl,al
 
+    ; Save old player position for breadcrumb marking
+
+    movzx rdi,byte [rel player_row]
+    movzx rsi,byte [rel player_col]
+
     call record_move
 
     call erase_player
@@ -360,7 +564,30 @@ game_loop:
     mov al,bl
     call move_player
 
+    ; Mark the old position as visited (breadcrumb)
+    ; Only mark if the move was successful (position changed)
+
+    movzx rax,byte [rel player_row]
+    cmp dil,al
+    jne .mark_old_pos
+    movzx rax,byte [rel player_col]
+    cmp sil,al
+    je .skip_breadcrumb
+
+.mark_old_pos:
+
+    mov rdi,rdi                ; old row
+    mov rsi,rsi                ; old col
+    call mark_visited
+
+.skip_breadcrumb:
+
     call check_collect
+
+    call check_hazard
+
+    cmp al,1
+    je .hazard_triggered
 
     call check_win
 
@@ -374,6 +601,11 @@ game_loop:
     call update_hud
 
     jmp game_loop
+
+.hazard_triggered:
+
+    ; Player was reset to start - redraw immediately
+    jmp redraw_level
 
 
 level_won:
@@ -414,11 +646,23 @@ level_won:
     mov rdx,win_message_len
     call print_string
 
-    ; brief pause so the message is readable, then continue
-    ; (we reuse read_key as a "press any key" gate)
+    ; Wait for ENTER to continue, but allow ESC to quit
 
+.wait_for_enter:
     call read_key
 
+    cmp al,27                  ; ESC to quit
+    je quit
+
+    cmp al,13                  ; Carriage return (Enter)
+    je .enter_pressed
+    cmp al,10                  ; Newline (Enter on some terminals)
+    je .enter_pressed
+
+    ; Any other key - ignore and keep waiting
+    jmp .wait_for_enter
+
+.enter_pressed:
     call advance_level         ; AL = 1 if more levels remain
 
     cmp al,1
@@ -428,6 +672,34 @@ level_won:
 
 
 all_levels_done:
+
+    call clear_screen
+
+    mov rdi,10
+    mov rsi,15
+    call move_cursor
+
+    mov rsi,all_done_message
+    mov rdx,all_done_message_len
+    call print_string
+
+    ; Wait for ENTER to see final score, but allow ESC to quit
+
+.wait_for_final_enter:
+    call read_key
+
+    cmp al,27                  ; ESC to quit
+    je quit
+
+    cmp al,13                  ; Carriage return (Enter)
+    je .show_final_score
+    cmp al,10                  ; Newline (Enter on some terminals)
+    je .show_final_score
+
+    ; Any other key - ignore and keep waiting
+    jmp .wait_for_final_enter
+
+.show_final_score:
 
     call clear_screen
 
@@ -468,6 +740,15 @@ all_levels_done:
 
     lea rsi,[rel hud_number_buffer]
     call print_string
+
+    ; Insert high score and save
+
+    call get_score
+    mov rsi,rax
+    lea rdi,[rel player_name]
+    call insert_highscore
+
+    call save_highscores
 
     call read_key
 

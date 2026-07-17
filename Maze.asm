@@ -79,7 +79,7 @@ level2_data:
     db "### ### ##### ### # ##### ###"
     db "# # #   #   #   # # #   #   #"
     db "# # # ### # ### # # # # ### #"
-    db "# #   #   #   #   # # # #   #"
+    db "# #   #   #   # X # # # #   #"
     db "# ##### ### ####### # # # # #"
     db "# #     #   #       # # # # #"
     db "# # # ##### # ####### # # # #"
@@ -102,13 +102,13 @@ level3_data:
     db "### ##### # ########### ### # ####### #"
     db "# # #   #       #       # # #       # #"
     db "# # # # ####### # ####### # # ##### # #"
-    db "# #   #   #   # # #   # #   # #   #E# #"
+    db "# #   #   #   # # # X # #   # #   #E# #"
     db "# ####### # ### # # # # # ##### # ### #"
     db "#       # #     # # # #         #   # #"
     db "####### # ####### # # ############# # #"
     db "#       #       #   #     #       # # #"
     db "# ############# # ####### ##### # # # #"
-    db "#   #       # # # #   #   #     # # # #"
+    db "#   #       # X # #   #   #     # # # #"
     db "### # ### # # # # ### # ### ####### # #"
     db "#   #   # #   # #     # #         # # #"
     db "# ##### # ##### ####### # ####### # # #"
@@ -173,6 +173,7 @@ extern print_char
 extern set_color
 extern reset_color
 extern get_collectible_tile
+extern is_visited
 
 ; Mirror of the COLOR_* constants defined in terminal.asm.
 ; NASM `equ` constants don't cross files, so this is
@@ -182,6 +183,8 @@ COLOR_WALL equ 0
 COLOR_EXIT equ 2
 COLOR_COIN equ 3
 COLOR_GEM  equ 4
+COLOR_BREADCRUMB equ 7
+COLOR_HAZARD equ 8
 
 
 ;=========================================================
@@ -322,6 +325,8 @@ draw_maze:
     je .colored_wall
     cmp al,'E'
     je .colored_exit
+    cmp al,'X'
+    je .colored_hazard
 
     ; plain tile -- might still have an uncollected coin/gem
     ; sitting on it, so route through a check rather than
@@ -347,6 +352,15 @@ draw_maze:
     call reset_color
     jmp .after_print
 
+.colored_hazard:
+
+    mov al,COLOR_HAZARD
+    call set_color
+    pop rax
+    call print_char
+    call reset_color
+    jmp .after_print
+
 .plain_tile:
 
     ; discard the stashed char -- get_collectible_tile clobbers
@@ -366,7 +380,7 @@ draw_maze:
     cmp al,2
     je .draw_gem
 
-    ; no item here -- recompute and print the plain character
+    ; no item here -- recompute and check if visited
 
     mov rax, r8
     mov rbx, [rel current_width]
@@ -375,7 +389,29 @@ draw_maze:
     mov rbx, [rel current_maze_ptr]
     mov al, [rbx + rax]
 
+    ; Check if this tile has been visited
+
+    push rax
+    mov rdi,r8
+    mov rsi,r9
+    call is_visited
+    pop rax
+
+    cmp al,1
+    je .draw_breadcrumb
+
+    ; Not visited - print plain character
+
     jmp .print_it
+
+.draw_breadcrumb:
+
+    mov al,COLOR_BREADCRUMB
+    call set_color
+    mov al,' '
+    call print_char
+    call reset_color
+    jmp .after_print
 
 .draw_coin:
 

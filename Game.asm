@@ -42,7 +42,26 @@ game_state db 0
 ; 0-based index of the level currently being played
 level_index db 0
 
-win_message      db "LEVEL COMPLETE!"
+
+;---------------------------------------------------------
+; High-score file format
+;
+; File: highscores.dat
+; Fixed binary format: 3 records, each record is:
+;   - Player name: 20 bytes (null-padded if shorter)
+;   - Score: 8 bytes (qword, little-endian)
+; Total file size: 3 * 28 = 84 bytes
+;---------------------------------------------------------
+
+HIGHSCORE_NAME_MAX  equ 20
+HIGHSCORE_SCORE_SIZE equ 8
+HIGHSCORE_RECORD_SIZE equ (HIGHSCORE_NAME_MAX + HIGHSCORE_SCORE_SIZE)
+HIGHSCORE_NUM_RECORDS equ 3
+HIGHSCORE_FILE_SIZE equ (HIGHSCORE_NUM_RECORDS * HIGHSCORE_RECORD_SIZE)
+
+highscore_filename db "highscores.dat", 0
+
+win_message      db "LEVEL COMPLETE! Press ENTER to continue"
 win_message_len  equ $ - win_message
 
 all_done_message     db "YOU ESCAPED EVERY MAZE!"
@@ -74,6 +93,7 @@ COLLECTIBLE_ENTRY_SIZE equ 3
 
 COIN_SCORE equ 10
 GEM_SCORE  equ 25
+HAZARD_PENALTY equ 50
 
 level1_collectibles:
     db 3,4,COLLECTIBLE_TYPE_COIN
@@ -108,7 +128,18 @@ section .bss
 collected_flags resb COLLECTIBLES_PER_LEVEL
 
 
-section .bss
+;---------------------------------------------------------
+; In-memory high-score table (3 records)
+;---------------------------------------------------------
+
+highscore_table resb HIGHSCORE_FILE_SIZE
+
+
+; Breadcrumb trail: visited tiles for current level
+; Maximum maze size is level 3: 39x17 = 663 tiles
+; We use a byte per tile (0 = not visited, 1 = visited)
+breadcrumb_map resb 663
+
 
 ; Moves taken on the current level
 move_count resq 1
@@ -139,10 +170,25 @@ global win_message
 global win_message_len
 global all_done_message
 global all_done_message_len
+global load_highscores
+global save_highscores
+global insert_highscore
+global highscore_table
+global restart_level
+global mark_visited
+global is_visited
+global reset_breadcrumbs
+global breadcrumb_map
+global check_hazard
+global set_level_index
+global reset_score
 
 extern get_tile
 extern player_row
 extern player_col
+extern spawn_player
+extern load_level
+extern current_width
 
 ; NUM_LEVELS is defined in maze.asm; redeclare here as extern
 ; constant via a small wrapper isn't possible for `equ`
@@ -227,6 +273,10 @@ reset_game_state:
     inc rdi
     dec rcx
     jnz .clear_loop
+
+    ; Reset breadcrumbs for the fresh level
+
+    call reset_breadcrumbs
 
     ; point current_collectible_table at this level's table.
     ; level_index is already tracked in this file (used by
@@ -542,4 +592,560 @@ get_collectible_tile:
 
     pop r14
     pop rbx
+    ret
+
+
+;=========================================================
+;
+; load_highscores()
+;
+; Loads high scores from highscores.dat file. If file doesn't
+; exist or is corrupted, initializes empty table (all scores = 0).
+;
+;=========================================================
+
+load_highscores:
+
+    push rbx
+    push r12
+    push r13
+
+    ; Try to open the file for reading
+
+    mov rax,2                  ; open syscall
+    mov rdi,highscore_filename
+    mov rsi,0                  ; O_RDONLY
+    mov rdx,0                  ; no mode needed for read-only
+    syscall
+
+    cmp rax,0
+    jl .file_not_found         ; error opening file
+
+    mov r12,rax                ; r12 = file descriptor
+
+    ; Read the file
+
+    mov rax,0                  ; read syscall
+    mov rdi,r12                ; fd
+    lea rsi,[rel highscore_table]
+    mov rdx,HIGHSCORE_FILE_SIZE
+    syscall
+
+    mov r13,rax                ; r13 = bytes read
+
+    ; Close the file
+
+    mov rax,3                  ; close syscall
+    mov rdi,r12
+    syscall
+
+    ; If we read less than expected, initialize to zeros
+
+    cmp r13,HIGHSCORE_FILE_SIZE
+    jge .done
+
+.file_not_found:
+
+    ; Initialize highscore_table to all zeros
+
+    xor rax,rax
+    mov rcx,HIGHSCORE_FILE_SIZE
+    lea rdi,[rel highscore_table]
+
+.init_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .init_loop
+
+.done:
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; save_highscores()
+;
+; Writes the current high-score table to highscores.dat.
+; If write fails, silently continues (doesn't crash).
+;
+;=========================================================
+
+save_highscores:
+
+    push rbx
+    push r12
+
+    ; Open file for writing (create/truncate)
+
+    mov rax,2                  ; open syscall
+    mov rdi,highscore_filename
+    mov rsi,0x241              ; O_WRONLY | O_CREAT | O_TRUNC
+    mov rdx,0o644             ; rw-r--r--
+    syscall
+
+    cmp rax,0
+    jl .done                   ; error opening file
+
+    mov r12,rax                ; r12 = file descriptor
+
+    ; Write the table
+
+    mov rax,1                  ; write syscall
+    mov rdi,r12
+    lea rsi,[rel highscore_table]
+    mov rdx,HIGHSCORE_FILE_SIZE
+    syscall
+
+    ; Close the file
+
+    mov rax,3                  ; close syscall
+    mov rdi,r12
+    syscall
+
+.done:
+
+    pop r12
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; insert_highscore(name_ptr, score)
+;
+; Inserts a new high score into the table if it qualifies.
+; Maintains sorted order (highest first). Shifts out the
+; lowest score if table is full.
+;
+; Input:
+;   RDI = pointer to null-terminated player name
+;   RSI = score (qword)
+;
+;=========================================================
+
+insert_highscore:
+
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12,rdi                ; r12 = name pointer
+    mov r13,rsi                ; r13 = score to insert
+
+    ; Find the lowest score in the table (last record)
+
+    lea rbx,[rel highscore_table]
+    add rbx,(HIGHSCORE_NUM_RECORDS - 1) * HIGHSCORE_RECORD_SIZE
+    add rbx,HIGHSCORE_NAME_MAX ; skip to score field
+
+    mov r14,[rbx]              ; r14 = lowest current score
+
+    ; If table is full and new score is lower, don't insert
+
+    cmp r14,0
+    je .insert_needed          ; table has empty slots
+
+    cmp r13,r14
+    jle .done                  ; new score not high enough
+
+.insert_needed:
+
+    ; Find insertion position (first score lower than ours, or end)
+
+    xor r15,r15                ; r15 = record index
+
+.find_loop:
+
+    cmp r15,HIGHSCORE_NUM_RECORDS
+    je .insert_at_end
+
+    lea rbx,[rel highscore_table]
+    mov rax,r15
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax
+    add rbx,HIGHSCORE_NAME_MAX ; skip to score field
+
+    mov r14,[rbx]              ; current score at this position
+
+    cmp r14,0
+    je .insert_here            ; empty slot
+
+    cmp r13,r14
+    jg .insert_here            ; our score is higher
+
+    inc r15
+    jmp .find_loop
+
+.insert_at_end:
+
+    mov r15,HIGHSCORE_NUM_RECORDS - 1
+
+.insert_here:
+
+    ; Shift records down from insertion position
+
+    cmp r15,HIGHSCORE_NUM_RECORDS - 1
+    je .no_shift
+
+.shift_loop:
+
+    mov r14,r15
+    inc r14
+    cmp r14,HIGHSCORE_NUM_RECORDS
+    jge .no_shift
+
+    ; Calculate source and dest addresses
+
+    lea rbx,[rel highscore_table]
+    mov rax,r14
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax                ; source = record at r14
+
+    lea rcx,[rel highscore_table]
+    mov rdx,r15
+    imul rdx,HIGHSCORE_RECORD_SIZE
+    add rcx,rdx               ; dest = record at r15
+
+    ; Copy one record (28 bytes)
+
+    mov rdi,rcx
+    mov rsi,rbx
+    mov rcx,HIGHSCORE_RECORD_SIZE
+
+.copy_loop:
+    mov al,[rsi]
+    mov [rdi],al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .copy_loop
+
+    inc r15
+    jmp .shift_loop
+
+.no_shift:
+
+    ; Insert new record at position r15
+
+    lea rbx,[rel highscore_table]
+    mov rax,r15
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax                ; rbx = insertion point
+
+    ; Copy name (up to HIGHSCORE_NAME_MAX, null-pad if shorter)
+
+    mov rdi,rbx
+    mov rsi,r12
+    mov rcx,HIGHSCORE_NAME_MAX
+    xor rdx,rdx                ; rdx = bytes copied
+
+.name_loop:
+
+    cmp rdx,HIGHSCORE_NAME_MAX
+    jge .name_done
+
+    mov al,[rsi]
+    cmp al,0
+    je .name_null_found
+
+    mov [rdi],al
+    inc rsi
+    inc rdi
+    inc rdx
+    jmp .name_loop
+
+.name_null_found:
+
+    ; Pad remaining bytes with nulls
+
+.pad_loop:
+
+    cmp rdx,HIGHSCORE_NAME_MAX
+    jge .name_done
+
+    mov byte [rdi],0
+    inc rdi
+    inc rdx
+    jmp .pad_loop
+
+.name_done:
+
+    ; Write score
+
+    add rbx,HIGHSCORE_NAME_MAX
+    mov [rbx],r13
+
+.done:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; restart_level()
+;
+; Restarts the current level: resets player position to start,
+; resets move counter to 0, and resets collectibles to unclaimed.
+; Does NOT reset cumulative score or change the level.
+;
+;=========================================================
+
+restart_level:
+
+    push rbx
+    push r12
+
+    ; Get current level index
+
+    call current_level_index
+    movzx rdi,al
+
+    ; Reload level to get start position
+
+    call load_level
+
+    ; AL = start row, AH = start col from load_level
+
+    mov cl,ah          ; cl = start col
+    mov dil,al         ; dil = start row
+    mov sil,cl         ; sil = start col
+    call spawn_player
+
+    ; Reset move counter
+
+    mov qword [rel move_count],0
+
+    ; Reset all "collected" flags for this level
+
+    xor rax,rax
+    mov rcx,COLLECTIBLES_PER_LEVEL
+    lea rdi,[rel collected_flags]
+
+.clear_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .clear_loop
+
+    ; Reset breadcrumbs
+
+    call reset_breadcrumbs
+
+    pop r12
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; reset_breadcrumbs()
+;
+; Clears the breadcrumb map for the current level.
+; Called on level load and restart.
+;
+;=========================================================
+
+reset_breadcrumbs:
+
+    push rbx
+    push rcx
+
+    xor rax,rax
+    mov rcx,663                ; max maze size
+    lea rdi,[rel breadcrumb_map]
+
+.bc_clear_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .bc_clear_loop
+
+    pop rcx
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; mark_visited(row, col)
+;
+; Marks a tile as visited in the breadcrumb map.
+;
+; Input:
+;   RDI = row
+;   RSI = col
+;
+;=========================================================
+
+mark_visited:
+
+    push rbx
+    push rcx
+
+    ; Calculate index: row * width + col
+
+    mov rax,rdi
+    mov rbx,[rel current_width]
+    mul rbx
+    add rax,rsi
+
+    ; Mark as visited
+
+    lea rbx,[rel breadcrumb_map]
+    mov byte [rbx+rax],1
+
+    pop rcx
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; is_visited(row, col)
+;
+; Checks if a tile has been visited.
+;
+; Input:
+;   RDI = row
+;   RSI = col
+;
+; Output:
+;   AL = 1 if visited, 0 if not
+;
+;=========================================================
+
+is_visited:
+
+    push rbx
+
+    ; Calculate index: row * width + col
+
+    mov rax,rdi
+    mov rbx,[rel current_width]
+    mul rbx
+    add rax,rsi
+
+    ; Check visited flag
+
+    lea rbx,[rel breadcrumb_map]
+    mov al,[rbx+rax]
+
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; check_hazard()
+;
+; Checks if the player is standing on a hazard tile.
+; If so, applies penalty and resets position to start.
+;
+; Output:
+;   AL = 1 if hazard was triggered, 0 otherwise
+;
+;=========================================================
+
+check_hazard:
+
+    push rbx
+    push r12
+    push r13
+
+    movzx rdi,byte [rel player_row]
+    movzx rsi,byte [rel player_col]
+
+    call get_tile
+
+    cmp al,'X'
+    jne .no_hazard
+
+    ; Hazard triggered - deduct penalty from score
+
+    mov rax,[rel score]
+    cmp rax,HAZARD_PENALTY
+    jge .deduct
+
+    ; Score would go negative - clamp to 0
+
+    mov qword [rel score],0
+    jmp .reset_position
+
+.deduct:
+
+    sub rax,HAZARD_PENALTY
+    mov [rel score],rax
+
+.reset_position:
+
+    ; Reset player to start position (like restart_level but
+    ; without resetting move counter or collectibles)
+
+    call current_level_index
+    movzx rdi,al
+
+    call load_level
+
+    mov cl,ah
+    mov dil,al
+    mov sil,cl
+    call spawn_player
+
+    mov al,1
+    jmp .done
+
+.no_hazard:
+
+    xor al,al
+
+.done:
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+;=========================================================
+;
+; set_level_index(level)
+;
+; Sets the current level index to the specified value.
+; Used for level selection at splash screen.
+;
+; Input:
+;   DIL = level index (0, 1, or 2 for levels 1, 2, 3)
+;
+;=========================================================
+
+set_level_index:
+
+    mov [rel level_index],dil
+    ret
+
+
+;=========================================================
+;
+; reset_score()
+;
+; Resets the cumulative score to 0.
+; Used when starting from a non-level-1 start.
+;
+;=========================================================
+
+reset_score:
+
+    mov qword [rel score],0
     ret

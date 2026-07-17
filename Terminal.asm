@@ -61,6 +61,8 @@ color_coin_code   db 27, "[93m"      ; yellow  -- coins
 color_gem_code    db 27, "[96m"      ; cyan    -- gems
 color_hud_code    db 27, "[97m"      ; white   -- HUD text
 color_title_code  db 27, "[95m"      ; magenta -- splash/title text
+color_breadcrumb_code db 27, "[90m"  ; black/dark gray -- visited tiles
+color_hazard_code db 27, "[91m"      ; red     -- hazard tiles
 reset_color_code  db 27, "[0m"
 
 color_code_len equ 5
@@ -130,6 +132,8 @@ COLOR_COIN   equ 3
 COLOR_GEM    equ 4
 COLOR_HUD    equ 5
 COLOR_TITLE  equ 6
+COLOR_BREADCRUMB equ 7
+COLOR_HAZARD equ 8
 
 
 ;=========================================================
@@ -314,6 +318,10 @@ set_color:
     je .hud
     cmp al,COLOR_TITLE
     je .title
+    cmp al,COLOR_BREADCRUMB
+    je .breadcrumb
+    cmp al,COLOR_HAZARD
+    je .hazard
 
     ret
 
@@ -337,6 +345,12 @@ set_color:
     jmp .emit
 .title:
     lea rsi,[rel color_title_code]
+    jmp .emit
+.breadcrumb:
+    lea rsi,[rel color_breadcrumb_code]
+    jmp .emit
+.hazard:
+    lea rsi,[rel color_hazard_code]
 
 .emit:
     mov rax,1
