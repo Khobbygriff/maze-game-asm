@@ -1,17 +1,5 @@
 ;=========================================================
 ; main.asm
-;
-; Orchestrates the overall game flow:
-;
-;   1. Enable raw keyboard mode (real-time input)
-;   2. For each level:
-;        - load level data, spawn player
-;        - draw maze + HUD
-;        - loop: read key -> move -> check win -> redraw
-;        - on win, show "level complete" and advance
-;   3. On completing all levels, show final score screen
-;   4. Always restore the terminal before exiting
-;
 ;=========================================================
 
 
@@ -26,7 +14,7 @@ moves_label_len   equ $ - moves_label
 score_label       db "  SCORE: "
 score_label_len   equ $ - score_label
 
-quit_hint         db "  (WASD to move, ESC to quit)"
+quit_hint         db "  (WASD to move, R to restart, ESC to quit, H for help)"
 quit_hint_len     equ $ - quit_hint
 
 final_score_label db "FINAL SCORE: "
@@ -38,11 +26,11 @@ name_prompt_len  equ $ - name_prompt
 name_greeting_prefix     db "  Player: "
 name_greeting_prefix_len equ $ - name_greeting_prefix
 
-; --- Splash screen ---
-; Cleared and redrawn as a set of print_string calls at
-; fixed rows rather than one giant multi-line literal, since
-; NASM db strings can't easily embed row-positioning escape
-; codes per line.
+highscore_header    db "HIGH SCORES:"
+highscore_header_len equ $ - highscore_header
+
+score_separator     db " - "
+score_separator_len equ $ - score_separator
 
 splash_title      db "======  ASM MAZE ESCAPE  ======"
 splash_title_len  equ $ - splash_title
@@ -50,7 +38,8 @@ splash_title_len  equ $ - splash_title
 splash_hint       db "Press any key to start  --  press H for help"
 splash_hint_len   equ $ - splash_hint
 
-; --- Help screen ---
+level_select_prompt db "Select starting level: [1] [2] [3] [4]   (press H for help)"
+level_select_prompt_len equ $ - level_select_prompt
 
 help_title        db "======  HELP  ======"
 help_title_len    equ $ - help_title
@@ -70,12 +59,12 @@ help_line4_len    equ $ - help_line4
 help_line5        db "Green  E ... exit  (finishes the level)"
 help_line5_len    equ $ - help_line5
 
+help_line6        db "Red    X ... hazard (-50 points, resets position)"
+help_line6_len    equ $ - help_line6
+
 help_back_hint    db "Press any key to return"
 help_back_hint_len equ $ - help_back_hint
 
-; Points awarded for finishing a level, scaled down by the
-; number of moves taken -- fewer moves, higher bonus. Encourages
-; efficient pathing rather than just wandering to the exit.
 LEVEL_BASE_SCORE equ 1000
 
 PLAYER_NAME_MAX_LEN equ 24
@@ -125,22 +114,23 @@ extern current_height
 extern read_line
 extern set_color
 extern reset_color
+extern load_highscores
+extern save_highscores
+extern insert_highscore
+extern highscore_table
+extern restart_level
+extern mark_visited
+extern player_row
+extern player_col
+extern check_hazard
+extern set_level_index
+extern reset_score
 
-; Mirror of terminal.asm's color constants -- must stay in
-; sync (NASM equ constants don't cross files).
 COLOR_HUD   equ 5
 COLOR_TITLE equ 6
 
 
 _start:
-
-    ;------------------------------------------
-    ; Ask for the player's name FIRST, while the
-    ; terminal is still in normal (canonical) mode.
-    ; read_line relies on the terminal's own line
-    ; editing/echo, which raw mode disables -- so
-    ; this must happen before enable_raw_mode.
-    ;------------------------------------------
 
     mov rsi,name_prompt
     mov rdx,name_prompt_len
@@ -149,6 +139,8 @@ _start:
     lea rdi,[rel player_name]
     mov rsi,PLAYER_NAME_MAX_LEN
     call read_line
+
+    call load_highscores
 
     call enable_raw_mode
 
@@ -180,21 +172,65 @@ splash_screen:
 
     call print_player_name
 
+    call display_highscores
+
     mov rdi,13
     mov rsi,5
     call move_cursor
 
-    mov rsi,splash_hint
-    mov rdx,splash_hint_len
+    mov rsi,level_select_prompt
+    mov rdx,level_select_prompt_len
     call print_string
 
+.level_select_loop:
+
     call read_key
+
+    cmp al,27
+    je quit
 
     cmp al,'h'
     je help_screen
     cmp al,'H'
     je help_screen
 
+    cmp al,'1'
+    je .level_1
+    cmp al,'2'
+    je .level_2
+    cmp al,'3'
+    je .level_3
+    cmp al,'4'
+    je .level_4
+
+    jmp .level_select_loop
+
+.level_1:
+
+    xor dil,dil
+    call set_level_index
+    call reset_score
+    jmp start_level
+
+.level_2:
+
+    mov dil,1
+    call set_level_index
+    call reset_score
+    jmp start_level
+
+.level_3:
+
+    mov dil,2
+    call set_level_index
+    call reset_score
+    jmp start_level
+
+.level_4:
+
+    mov dil,3
+    call set_level_index
+    call reset_score
     jmp start_level
 
 
@@ -250,7 +286,14 @@ help_screen:
     mov rdx,help_line5_len
     call print_string
 
-    mov rdi,11
+    mov rdi,10
+    mov rsi,5
+    call move_cursor
+    mov rsi,help_line6
+    mov rdx,help_line6_len
+    call print_string
+
+    mov rdi,12
     mov rsi,5
     call move_cursor
     mov rsi,help_back_hint
@@ -262,17 +305,6 @@ help_screen:
     jmp splash_screen
 
 
-;=========================================================
-;
-; print_player_name()
-;
-; Prints the null-terminated player_name buffer using
-; print_len_string's measuring approach. Small standalone
-; helper since player_name isn't produced by int_to_string
-; (so callers elsewhere shouldn't assume that).
-;
-;=========================================================
-
 print_player_name:
 
     lea rsi,[rel player_name]
@@ -281,27 +313,106 @@ print_player_name:
     ret
 
 
+display_highscores:
+
+    push rbx
+    push r12
+    push r13
+
+    mov rdi,14
+    mov rsi,5
+    call move_cursor
+
+    mov al,COLOR_HUD
+    call set_color
+
+    mov rsi,highscore_header
+    mov rdx,highscore_header_len
+    call print_string
+
+    call reset_color
+
+    xor rbx,rbx
+
+.hs_loop:
+
+    cmp rbx,3
+    jge .hs_done
+
+    lea r12,[rel highscore_table]
+    mov rax,rbx
+    imul rax,28
+    add r12,rax
+
+    mov r13,[r12+20]
+    cmp r13,0
+    je .hs_next
+
+    mov rdi,15
+    mov rsi,5
+    add rdi,rbx
+    call move_cursor
+
+    mov al,'1'
+    add al,bl
+    call print_char
+
+    mov al,'.'
+    call print_char
+
+    mov al,' '
+    call print_char
+
+    mov rdi,r12
+    mov rcx,20
+
+.name_loop:
+    cmp rcx,0
+    je .name_done
+    mov al,[rdi]
+    cmp al,0
+    je .name_done
+    call print_char
+    inc rdi
+    dec rcx
+    jmp .name_loop
+
+.name_done:
+
+    mov rsi,score_separator
+    mov rdx,score_separator_len
+    call print_string
+
+    mov rax,r13
+    lea rdi,[rel hud_number_buffer]
+    call int_to_string
+
+    lea rsi,[rel hud_number_buffer]
+    call print_len_string
+
+.hs_next:
+
+    inc rbx
+    jmp .hs_loop
+
+.hs_done:
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
 start_level:
 
-    ;------------------------------------------
-    ; Load current level's maze + start position
-    ;
-    ; AL = start row, AH = start col (from load_level)
-    ;------------------------------------------
-
-    movzx rdi,byte [rel current_level_holder]
     call current_level_index
     movzx rdi,al
 
     call load_level
 
-    ; AL/AH hold start row/col from load_level. AH cannot be
-    ; mixed with a REX-prefixed register (like SIL) in the
-    ; same instruction, so stage the column through CL first.
-
-    mov cl,ah          ; cl = start col
-    mov dil,al         ; dil = start row
-    mov sil,cl         ; sil = start col
+    mov cl,ah
+    mov dil,al
+    mov sil,cl
     call spawn_player
 
     call reset_game_state
@@ -317,21 +428,15 @@ redraw_level:
 
 game_loop:
 
-    ;------------------------------------------
-    ; Read keyboard input (blocks until a key
-    ; is pressed -- raw mode means no Enter
-    ; needed and no line echo)
-    ;------------------------------------------
-
     call read_key
-
-    ; ESC exits immediately
 
     cmp al,27
     je quit
 
-    ; Ignore keys that aren't movement keys so the move
-    ; counter and redraw only fire on real attempts
+    cmp al,'r'
+    je .restart_key
+    cmp al,'R'
+    je .restart_key
 
     cmp al,'w'
     je .valid_key
@@ -344,14 +449,17 @@ game_loop:
 
     jmp game_loop
 
+.restart_key:
+
+    call restart_level
+    jmp redraw_level
+
 .valid_key:
 
-    ; AL holds the pressed key here, but erase_player() will
-    ; clobber AL (it uses it to print a space). Preserve the
-    ; key in a callee-saved register across that call so
-    ; move_player() still sees the correct direction.
-
     mov bl,al
+
+    movzx r12,byte [rel player_row]
+    movzx r13,byte [rel player_col]
 
     call record_move
 
@@ -360,7 +468,27 @@ game_loop:
     mov al,bl
     call move_player
 
+    movzx rax,byte [rel player_row]
+    cmp r12b,al
+    jne .mark_old_pos
+    movzx rax,byte [rel player_col]
+    cmp r13b,al
+    je .skip_breadcrumb
+
+.mark_old_pos:
+
+    mov rdi,r12
+    mov rsi,r13
+    call mark_visited
+
+.skip_breadcrumb:
+
     call check_collect
+
+    call check_hazard
+
+    cmp al,1
+    je .hazard_triggered
 
     call check_win
 
@@ -375,21 +503,17 @@ game_loop:
 
     jmp game_loop
 
+.hazard_triggered:
+
+    jmp redraw_level
+
 
 level_won:
 
-    ;------------------------------------------
-    ; Award score: base bonus minus a penalty
-    ; per move taken, floored at a small
-    ; minimum so it's never negative/zero.
-    ;------------------------------------------
-
-    call get_move_count        ; rax = moves taken
+    call get_move_count
 
     mov rbx,rax
     mov rax,LEVEL_BASE_SCORE
-
-    ; bonus = max(100, BASE - moves*5)
 
     mov rcx,rbx
     imul rcx,5
@@ -414,12 +538,21 @@ level_won:
     mov rdx,win_message_len
     call print_string
 
-    ; brief pause so the message is readable, then continue
-    ; (we reuse read_key as a "press any key" gate)
-
+.wait_for_enter:
     call read_key
 
-    call advance_level         ; AL = 1 if more levels remain
+    cmp al,27
+    je quit
+
+    cmp al,13
+    je .enter_pressed
+    cmp al,10
+    je .enter_pressed
+
+    jmp .wait_for_enter
+
+.enter_pressed:
+    call advance_level
 
     cmp al,1
     je start_level
@@ -439,7 +572,30 @@ all_levels_done:
     mov rdx,all_done_message_len
     call print_string
 
-    ; --- print final score on the next line ---
+.wait_for_final_enter:
+    call read_key
+
+    cmp al,27
+    je quit
+
+    cmp al,13
+    je .show_final_score
+    cmp al,10
+    je .show_final_score
+
+    jmp .wait_for_final_enter
+
+.show_final_score:
+
+    call clear_screen
+
+    mov rdi,10
+    mov rsi,15
+    call move_cursor
+
+    mov rsi,all_done_message
+    mov rdx,all_done_message_len
+    call print_string
 
     mov rdi,12
     mov rsi,15
@@ -452,8 +608,6 @@ all_levels_done:
     call get_score
     lea rdi,[rel hud_number_buffer]
     call int_to_string
-
-    ; print the number string (find its length first)
 
     lea rsi,[rel hud_number_buffer]
     xor rdx,rdx
@@ -469,29 +623,19 @@ all_levels_done:
     lea rsi,[rel hud_number_buffer]
     call print_string
 
+    call get_score
+    mov rsi,rax
+    lea rdi,[rel player_name]
+    call insert_highscore
+
+    call save_highscores
+
     call read_key
 
     jmp quit
 
 
-;=========================================================
-;
-; draw_hud()
-;
-; Draws the status line below the maze: current level
-; number, moves taken, and score. Called once per level
-; load (full draw) -- update_hud() is used for cheaper
-; per-move refreshes.
-;
-;=========================================================
-
 draw_hud:
-
-    ; Position the HUD one row below the current maze instead
-    ; of a fixed row -- keeps it snug against small mazes and
-    ; still clear of large ones, rather than leaving a fixed
-    ; gap sized for the tallest level regardless of which one
-    ; is actually loaded.
 
     mov al,COLOR_HUD
     call set_color
@@ -506,7 +650,7 @@ draw_hud:
     call print_string
 
     call current_level_index
-    inc al                      ; display as 1-based
+    inc al
     movzx rax,al
     lea rdi,[rel hud_number_buffer]
     call int_to_string
@@ -517,9 +661,6 @@ draw_hud:
     mov rsi,quit_hint
     mov rdx,quit_hint_len
     call print_string
-
-    ; player name goes on its own row so it's not squeezed
-    ; onto an already-long level/hint line
 
     mov rdi,[rel current_height]
     add rdi,3
@@ -539,21 +680,7 @@ draw_hud:
     ret
 
 
-;=========================================================
-;
-; update_hud()
-;
-; Redraws just the moves/score portion of the HUD (row 21).
-; Kept separate from draw_hud so we're not reprinting the
-; static level/hint text on every single keypress.
-;
-;=========================================================
-
 update_hud:
-
-    ; Same dynamic positioning as draw_hud, one row further
-    ; down (current_height + 2) so it sits directly under the
-    ; "LEVEL n ..." line rather than overlapping it.
 
     mov al,COLOR_HUD
     call set_color
@@ -585,9 +712,6 @@ update_hud:
     lea rsi,[rel hud_number_buffer]
     call print_len_string
 
-    ; clear any leftover characters from a longer previous
-    ; number by padding with spaces
-
     mov rsi,hud_clear_pad
     mov rdx,hud_clear_pad_len
     call print_string
@@ -596,16 +720,6 @@ update_hud:
 
     ret
 
-
-;=========================================================
-;
-; print_len_string(rsi = null-terminated string)
-;
-; Small helper: measures a null-terminated string (as
-; produced by int_to_string) and prints it via print_string,
-; which needs an explicit length rather than a terminator.
-;
-;=========================================================
 
 print_len_string:
 
@@ -637,13 +751,6 @@ quit:
 
 
 section .data
-
-; index of the "current level" isn't actually stored here --
-; game.asm is the source of truth via current_level_index().
-; This byte exists only so the very first call before any
-; level has loaded has a harmless placeholder to read;
-; it is not used for anything else.
-current_level_holder db 0
 
 hud_clear_pad     db "        "
 hud_clear_pad_len equ $ - hud_clear_pad

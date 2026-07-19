@@ -1,71 +1,28 @@
 ;=========================================================
 ; game.asm
-;
-; Owns overall game/session state:
-;
-;   - Win/lose/running status for the current level
-;   - Which level we're on
-;   - Score and move counter
-;   - Collectibles (coins/gems) per level
-;
-; Functions:
-;
-;   check_win()
-;   get_game_state()
-;   reset_game_state()
-;   current_level_index()
-;   advance_level()
-;   record_move()
-;   get_move_count()
-;   get_score()
-;   add_score(points)
-;   check_collect()
-;   get_collectible_tile(row,col)
-;   is_collectible_taken(index)
-;
 ;=========================================================
 
 
 section .data
 
-
-;---------------------------------------------------------
-; Game states
-;
-; 0 = running
-; 1 = won current level
-; 2 = all levels complete
-;---------------------------------------------------------
-
 game_state db 0
 
-; 0-based index of the level currently being played
 level_index db 0
 
-win_message      db "LEVEL COMPLETE!"
+HIGHSCORE_NAME_MAX  equ 20
+HIGHSCORE_SCORE_SIZE equ 8
+HIGHSCORE_RECORD_SIZE equ (HIGHSCORE_NAME_MAX + HIGHSCORE_SCORE_SIZE)
+HIGHSCORE_NUM_RECORDS equ 3
+HIGHSCORE_FILE_SIZE equ (HIGHSCORE_NUM_RECORDS * HIGHSCORE_RECORD_SIZE)
+
+highscore_filename db "highscores.dat", 0
+
+win_message      db "LEVEL COMPLETE! Press ENTER to continue"
 win_message_len  equ $ - win_message
 
 all_done_message     db "YOU ESCAPED EVERY MAZE!"
 all_done_message_len equ $ - all_done_message
 
-
-;---------------------------------------------------------
-; Collectibles
-;
-; Coordinates below were chosen with a BFS solver run
-; against each level's actual maze data, so every item sits
-; on a tile that's provably reachable on the way from P to
-; E (not just "looks open" by eye) -- same discipline used
-; to verify the mazes themselves are solvable.
-;
-; Fixed at 4 items per level: 2 coins, 2 gems. Layout is
-; (row, col, type) as 3 bytes per entry; a level with fewer
-; than the max uses row=255 as an unused/"no item" marker
-; (255 is never a valid row for these maze sizes, so it's a
-; safe sentinel rather than colliding with real data).
-;
-; type: 0 = coin (10 pts), 1 = gem (25 pts)
-;---------------------------------------------------------
 
 COLLECTIBLE_TYPE_COIN equ 0
 COLLECTIBLE_TYPE_GEM  equ 1
@@ -74,6 +31,20 @@ COLLECTIBLE_ENTRY_SIZE equ 3
 
 COIN_SCORE equ 10
 GEM_SCORE  equ 25
+HAZARD_PENALTY equ 50
+
+; Must be >= the tile count of the largest level in maze.asm's
+; level_table (width * height). Currently that's level 4 at
+; 41x19 = 779. This was previously hardcoded as 663 (level 3's
+; 39x17), which was correct only until level 4 was added --
+; mark_visited/is_visited index this buffer as row*width+col,
+; so once current_width/current_height exceeded 663 tiles, any
+; visited tile past index 662 wrote one byte past the end of
+; this buffer into whatever .bss symbol happens to follow it.
+; If a larger level is ever added, this constant must grow to
+; match, and reset_breadcrumbs' clear loop (which reads this
+; same constant) will follow automatically.
+BREADCRUMB_MAP_SIZE equ 779
 
 level1_collectibles:
     db 3,4,COLLECTIBLE_TYPE_COIN
@@ -93,31 +64,11 @@ level3_collectibles:
     db 3,20,COLLECTIBLE_TYPE_COIN
     db 15,20,COLLECTIBLE_TYPE_GEM
 
-;----------------------------------------------------------
-; Level 4 collectibles -- deliberately split two ways:
-;
-;   - 2 "legit" items sit ON the true solution path (roughly
-;     a third and two-thirds of the way along it), same as
-;     every other level -- a normal progress reward.
-;   - 2 "bait" items sit deep inside two of the level's
-;     decoy loops (see the comment above level4_data in
-;     maze.asm), 22-23 tiles down a dead end. Finding a coin
-;     or gem down a side corridor is meant to read as "you're
-;     on the right track," which is exactly the wrong
-;     conclusion in a maze whose whole point is that some
-;     inviting-looking branches don't lead anywhere.
-;
-; All 4 positions were checked against the same rule used for
-; every other level: each sits on a tile reachable from P AND
-; has at least two open neighboring tiles, so nothing renders
-; visually embedded in a wall.
-;----------------------------------------------------------
-
 level4_collectibles:
-    db 4,17,COLLECTIBLE_TYPE_COIN    ; legit -- on true path
-    db 11,33,COLLECTIBLE_TYPE_GEM    ; legit -- on true path
-    db 1,16,COLLECTIBLE_TYPE_COIN    ; bait  -- dead-end loop, depth 22
-    db 3,30,COLLECTIBLE_TYPE_GEM     ; bait  -- dead-end loop, depth 23
+    db 4,17,COLLECTIBLE_TYPE_COIN
+    db 11,33,COLLECTIBLE_TYPE_GEM
+    db 1,16,COLLECTIBLE_TYPE_COIN
+    db 3,30,COLLECTIBLE_TYPE_GEM
 
 collectible_table:
     dq level1_collectibles
@@ -128,23 +79,16 @@ collectible_table:
 
 section .bss
 
-; "collected" flags for the current level's 4 items, reset
-; on every level load. Separate from the (row,col,type) data
-; above since that data is level-static and this is runtime
-; per-level state.
 collected_flags resb COLLECTIBLES_PER_LEVEL
 
+highscore_table resb HIGHSCORE_FILE_SIZE
 
-section .bss
+breadcrumb_map resb BREADCRUMB_MAP_SIZE
 
-; Moves taken on the current level
 move_count resq 1
 
-; Cumulative score across all levels
 score resq 1
 
-; Pointer to the current level's collectible table, set by
-; reset_game_state (which is called once per level load).
 current_collectible_table resq 1
 
 
@@ -166,31 +110,27 @@ global win_message
 global win_message_len
 global all_done_message
 global all_done_message_len
+global load_highscores
+global save_highscores
+global insert_highscore
+global highscore_table
+global restart_level
+global mark_visited
+global is_visited
+global reset_breadcrumbs
+global breadcrumb_map
+global check_hazard
+global set_level_index
+global reset_score
 
 extern get_tile
 extern player_row
 extern player_col
+extern spawn_player
+extern load_level
+extern current_width
 
-; NUM_LEVELS is defined in maze.asm; redeclare here as extern
-; constant via a small wrapper isn't possible for `equ`
-; across files in NASM, so game.asm asks maze.asm for the
-; count through a tiny accessor instead of duplicating the
-; literal.
 extern get_num_levels
-
-
-;=========================================================
-;
-; check_win()
-;
-; Checks whether the player is standing on the exit tile
-; ('E'). If so, marks the level as won.
-;
-; Output:
-;
-;   game_state becomes 1 if the level was just won
-;
-;=========================================================
 
 
 check_win:
@@ -210,40 +150,16 @@ check_win:
     ret
 
 
-;=========================================================
-;
-; get_game_state()
-;
-; Output:
-;
-;   AL = current state (0=running, 1=level won, 2=all done)
-;
-;=========================================================
-
-
 get_game_state:
 
     mov al,[rel game_state]
     ret
 
 
-;=========================================================
-;
-; reset_game_state()
-;
-; Resets state to "running" and zeroes the move counter.
-; Called at the start of every level (fresh maze = fresh
-; move count, but score carries over between levels).
-;
-;=========================================================
-
-
 reset_game_state:
 
     mov byte [rel game_state],0
     mov qword [rel move_count],0
-
-    ; clear all "collected" flags for the fresh level
 
     xor rax,rax
     mov rcx,COLLECTIBLES_PER_LEVEL
@@ -255,14 +171,11 @@ reset_game_state:
     dec rcx
     jnz .clear_loop
 
-    ; point current_collectible_table at this level's table.
-    ; level_index is already tracked in this file (used by
-    ; current_level_index/advance_level), so we read it
-    ; directly rather than requiring a parameter.
+    call reset_breadcrumbs
 
     movzx rax,byte [rel level_index]
     mov rcx,8
-    mul rcx                    ; rax = level_index * 8 (qword stride)
+    mul rcx
 
     lea rbx,[rel collectible_table]
     add rbx,rax
@@ -273,53 +186,16 @@ reset_game_state:
     ret
 
 
-;=========================================================
-;
-; current_level_index()
-;
-; Output:
-;
-;   AL = 0-based index of the level being played
-;
-;=========================================================
-
-
 current_level_index:
 
     mov al,[rel level_index]
     ret
 
 
-;=========================================================
-;
-; advance_level()
-;
-; Moves to the next level if one exists.
-;
-; Output:
-;
-;   AL = 1 if a next level exists and was loaded,
-;        0 if that was the last level (game_state -> 2)
-;
-; IMPORTANT: level_index is deliberately NOT incremented
-; past NUM_LEVELS-1. reset_game_state() uses level_index to
-; index directly into collectible_table with no bounds check
-; of its own -- if level_index were allowed to sit at
-; NUM_LEVELS (one past the last valid entry) and
-; reset_game_state() were ever called again afterward (e.g.
-; a future "play again" path), it would read one descriptor
-; past the end of collectible_table. Today nothing calls
-; reset_game_state() after the last level, so this couldn't
-; yet happen -- clamping here means it never can, regardless
-; of what main.asm does with game_state later.
-;
-;=========================================================
-
-
 advance_level:
 
-    call get_num_levels        ; AL = NUM_LEVELS
-    dec al                     ; AL = highest valid index
+    call get_num_levels
+    dec al
 
     cmp [rel level_index],al
     jge .no_more_levels
@@ -330,24 +206,9 @@ advance_level:
 
 .no_more_levels:
 
-    ; stay on the last valid index -- do not increment past it
-
     mov byte [rel game_state],2
     mov al,0
     ret
-
-
-;=========================================================
-;
-; record_move()
-;
-; Increments the move counter for the current level.
-; Call this once per accepted keypress (movement attempt),
-; whether or not the move was actually valid -- this keeps
-; the counter simple to reason about: it's an input counter,
-; not a "successful steps" counter.
-;
-;=========================================================
 
 
 record_move:
@@ -356,32 +217,10 @@ record_move:
     ret
 
 
-;=========================================================
-;
-; get_move_count()
-;
-; Output:
-;
-;   RAX = moves taken on the current level
-;
-;=========================================================
-
-
 get_move_count:
 
     mov rax,[rel move_count]
     ret
-
-
-;=========================================================
-;
-; get_score()
-;
-; Output:
-;
-;   RAX = cumulative score
-;
-;=========================================================
 
 
 get_score:
@@ -390,37 +229,10 @@ get_score:
     ret
 
 
-;=========================================================
-;
-; add_score(points)
-;
-; Input:
-;
-;   RDI = points to add (can be a computed bonus)
-;
-;=========================================================
-
-
 add_score:
 
     add [rel score],rdi
     ret
-
-
-;=========================================================
-;
-; check_collect()
-;
-; Checks whether the player's current position matches an
-; uncollected item in the current level's collectible
-; table. If so, marks it collected and awards its score.
-; Called once per accepted move, right after move_player --
-; same call pattern as check_win().
-;
-; Silently does nothing if the player isn't standing on an
-; item, or the item there was already collected.
-;
-;=========================================================
 
 
 check_collect:
@@ -435,39 +247,33 @@ check_collect:
 
     mov r14,[rel current_collectible_table]
 
-    xor rcx,rcx                ; rcx = item index
+    xor rcx,rcx
 
 .check_loop:
 
     cmp rcx,COLLECTIBLES_PER_LEVEL
     jge .done
 
-    ; already collected? skip
-
     lea rbx,[rel collected_flags]
     cmp byte [rbx+rcx],0
     jne .next_item
-
-    ; compute entry address: table + index*3
 
     mov rax,rcx
     imul rax,COLLECTIBLE_ENTRY_SIZE
     add rax,r14
 
-    movzx rbx,byte [rax]        ; entry row
+    movzx rbx,byte [rax]
     cmp rbx,r12
     jne .next_item
 
-    movzx rbx,byte [rax+1]      ; entry col
+    movzx rbx,byte [rax+1]
     cmp rbx,r13
     jne .next_item
-
-    ; match -- mark collected and award score
 
     lea rbx,[rel collected_flags]
     mov byte [rbx+rcx],1
 
-    movzx rbx,byte [rax+2]      ; type
+    movzx rbx,byte [rax+2]
     cmp rbx,COLLECTIBLE_TYPE_GEM
     je .award_gem
 
@@ -481,8 +287,7 @@ check_collect:
 .award:
 
     call add_score
-    jmp .done                   ; only one item can occupy a
-                                 ; tile, so stop once matched
+    jmp .done
 
 .next_item:
 
@@ -497,28 +302,6 @@ check_collect:
     pop rbx
 
     ret
-
-
-;=========================================================
-;
-; get_collectible_tile(row,col)
-;
-; Looks up whether an uncollected item sits at the given
-; maze position, for draw_maze to render on top of the
-; empty-space tile there.
-;
-; Input:
-;
-;   RDI = row
-;   RSI = col
-;
-; Output:
-;
-;   AL = 0 if no item here (or it was already collected)
-;   AL = 1 if a coin is here
-;   AL = 2 if a gem is here
-;
-;=========================================================
 
 
 get_collectible_tile:
@@ -551,13 +334,11 @@ get_collectible_tile:
     cmp rbx,rsi
     jne .next
 
-    ; found an uncollected item at this position
-
     movzx rbx,byte [rax+2]
     cmp rbx,COLLECTIBLE_TYPE_GEM
     je .is_gem
 
-    mov al,1                     ; coin
+    mov al,1
     jmp .found
 
 .is_gem:
@@ -581,4 +362,398 @@ get_collectible_tile:
 
     pop r14
     pop rbx
+    ret
+
+
+load_highscores:
+
+    push rbx
+    push r12
+    push r13
+
+    mov rax,2
+    mov rdi,highscore_filename
+    mov rsi,0
+    mov rdx,0
+    syscall
+
+    cmp rax,0
+    jl .file_not_found
+
+    mov r12,rax
+
+    mov rax,0
+    mov rdi,r12
+    lea rsi,[rel highscore_table]
+    mov rdx,HIGHSCORE_FILE_SIZE
+    syscall
+
+    mov r13,rax
+
+    mov rax,3
+    mov rdi,r12
+    syscall
+
+    cmp r13,HIGHSCORE_FILE_SIZE
+    jge .done
+
+.file_not_found:
+
+    xor rax,rax
+    mov rcx,HIGHSCORE_FILE_SIZE
+    lea rdi,[rel highscore_table]
+
+.init_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .init_loop
+
+.done:
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+save_highscores:
+
+    push rbx
+    push r12
+
+    mov rax,2
+    mov rdi,highscore_filename
+    mov rsi,0x241
+    mov rdx,0o644
+    syscall
+
+    cmp rax,0
+    jl .done
+
+    mov r12,rax
+
+    mov rax,1
+    mov rdi,r12
+    lea rsi,[rel highscore_table]
+    mov rdx,HIGHSCORE_FILE_SIZE
+    syscall
+
+    mov rax,3
+    mov rdi,r12
+    syscall
+
+.done:
+
+    pop r12
+    pop rbx
+    ret
+
+
+insert_highscore:
+
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12,rdi
+    mov r13,rsi
+
+    lea rbx,[rel highscore_table]
+    add rbx,(HIGHSCORE_NUM_RECORDS - 1) * HIGHSCORE_RECORD_SIZE
+    add rbx,HIGHSCORE_NAME_MAX
+
+    mov r14,[rbx]
+
+    cmp r14,0
+    je .insert_needed
+
+    cmp r13,r14
+    jle .done
+
+.insert_needed:
+
+    xor r15,r15
+
+.find_loop:
+
+    cmp r15,HIGHSCORE_NUM_RECORDS
+    je .insert_at_end
+
+    lea rbx,[rel highscore_table]
+    mov rax,r15
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax
+    add rbx,HIGHSCORE_NAME_MAX
+
+    mov r14,[rbx]
+
+    cmp r14,0
+    je .insert_here
+
+    cmp r13,r14
+    jg .insert_here
+
+    inc r15
+    jmp .find_loop
+
+.insert_at_end:
+
+    mov r15,HIGHSCORE_NUM_RECORDS - 1
+
+.insert_here:
+
+    ; Shift records down from the bottom of the table upward
+    ; toward the insertion point r15, one slot each. This must
+    ; iterate bottom-up (source index walking DOWN from
+    ; NUM_RECORDS-2 to r15): shifting top-down instead
+    ; (starting at r15 and copying r15+1 -> r15, then
+    ; incrementing r15) overwrites the very slot being
+    ; inserted into with the record below it and drags the
+    ; insertion index itself to the bottom of the table --
+    ; that was the original bug, where a single insert into an
+    ; empty table landed in record 2 instead of record 0.
+
+    cmp r15,HIGHSCORE_NUM_RECORDS - 1
+    je .no_shift
+
+    mov r14,HIGHSCORE_NUM_RECORDS - 2   ; last movable source index
+
+.shift_loop:
+
+    cmp r14,r15
+    jl .no_shift                        ; done once source < insertion point
+
+    lea rbx,[rel highscore_table]
+    mov rax,r14
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax                          ; rbx = source record (r14)
+
+    lea rcx,[rel highscore_table]
+    mov rdx,r14
+    inc rdx
+    imul rdx,HIGHSCORE_RECORD_SIZE
+    add rcx,rdx                          ; rcx = dest record (r14+1)
+
+    mov rdi,rcx
+    mov rsi,rbx
+    mov rcx,HIGHSCORE_RECORD_SIZE
+
+.copy_loop:
+    mov al,[rsi]
+    mov [rdi],al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .copy_loop
+
+    dec r14
+    jmp .shift_loop
+
+.no_shift:
+
+    lea rbx,[rel highscore_table]
+    mov rax,r15
+    imul rax,HIGHSCORE_RECORD_SIZE
+    add rbx,rax
+
+    mov rdi,rbx
+    mov rsi,r12
+    mov rcx,HIGHSCORE_NAME_MAX
+    xor rdx,rdx
+
+.name_loop:
+
+    cmp rdx,HIGHSCORE_NAME_MAX
+    jge .name_done
+
+    mov al,[rsi]
+    cmp al,0
+    je .name_null_found
+
+    mov [rdi],al
+    inc rsi
+    inc rdi
+    inc rdx
+    jmp .name_loop
+
+.name_null_found:
+
+.pad_loop:
+
+    cmp rdx,HIGHSCORE_NAME_MAX
+    jge .name_done
+
+    mov byte [rdi],0
+    inc rdi
+    inc rdx
+    jmp .pad_loop
+
+.name_done:
+
+    add rbx,HIGHSCORE_NAME_MAX
+    mov [rbx],r13
+
+.done:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+restart_level:
+
+    push rbx
+    push r12
+
+    call current_level_index
+    movzx rdi,al
+
+    call load_level
+
+    mov cl,ah
+    mov dil,al
+    mov sil,cl
+    call spawn_player
+
+    mov qword [rel move_count],0
+
+    xor rax,rax
+    mov rcx,COLLECTIBLES_PER_LEVEL
+    lea rdi,[rel collected_flags]
+
+.clear_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .clear_loop
+
+    call reset_breadcrumbs
+
+    pop r12
+    pop rbx
+    ret
+
+
+reset_breadcrumbs:
+
+    push rbx
+    push rcx
+
+    xor rax,rax
+    mov rcx,BREADCRUMB_MAP_SIZE
+    lea rdi,[rel breadcrumb_map]
+
+.bc_clear_loop:
+    mov byte [rdi],0
+    inc rdi
+    dec rcx
+    jnz .bc_clear_loop
+
+    pop rcx
+    pop rbx
+    ret
+
+
+mark_visited:
+
+    push rbx
+    push rcx
+
+    mov rax,rdi
+    mov rbx,[rel current_width]
+    mul rbx
+    add rax,rsi
+
+    lea rbx,[rel breadcrumb_map]
+    mov byte [rbx+rax],1
+
+    pop rcx
+    pop rbx
+    ret
+
+
+is_visited:
+
+    push rbx
+
+    mov rax,rdi
+    mov rbx,[rel current_width]
+    mul rbx
+    add rax,rsi
+
+    lea rbx,[rel breadcrumb_map]
+    mov al,[rbx+rax]
+
+    pop rbx
+    ret
+
+
+check_hazard:
+
+    push rbx
+    push r12
+    push r13
+
+    movzx rdi,byte [rel player_row]
+    movzx rsi,byte [rel player_col]
+
+    call get_tile
+
+    cmp al,'X'
+    jne .no_hazard
+
+    mov rax,[rel score]
+    cmp rax,HAZARD_PENALTY
+    jge .deduct
+
+    mov qword [rel score],0
+    jmp .reset_position
+
+.deduct:
+
+    sub rax,HAZARD_PENALTY
+    mov [rel score],rax
+
+.reset_position:
+
+    call current_level_index
+    movzx rdi,al
+
+    call load_level
+
+    mov cl,ah
+    mov dil,al
+    mov sil,cl
+    call spawn_player
+
+    mov al,1
+    jmp .done
+
+.no_hazard:
+
+    xor al,al
+
+.done:
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+set_level_index:
+
+    mov [rel level_index],dil
+    ret
+
+
+reset_score:
+
+    mov qword [rel score],0
     ret
